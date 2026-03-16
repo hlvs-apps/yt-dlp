@@ -82,13 +82,9 @@ const innertubePlayerEndpoint = "https://www.youtube.com/youtubei/v1/player"
 
 // innertubeClientConfig groups all parameters needed to make an InnerTube
 // /player request for a particular client identity.
-//
-// Both android_vr and ios have REQUIRE_JS_PLAYER=False in yt-dlp, meaning
-// they return direct stream URLs that do not need signature-cipher decoding.
 type innertubeClientConfig struct {
-	// context is the JSON object placed under the "context" key in the
-	// request body.  It is reproduced verbatim from yt-dlp's
-	// INNERTUBE_CLIENTS registry.
+	// context is the JSON object placed under the "client" key inside
+	// "context" in the request body.
 	context map[string]interface{}
 	// clientNameID is the numeric identifier sent in X-Youtube-Client-Name.
 	clientNameID string
@@ -96,14 +92,34 @@ type innertubeClientConfig struct {
 	clientVersion string
 	// userAgent is sent in the User-Agent header.
 	userAgent string
+	// requiresJSPlayer indicates whether stream URLs from this client are
+	// wrapped in a signatureCipher field that must be deciphered using the
+	// YouTube player JavaScript.  When false, URLs are direct.
+	requiresJSPlayer bool
+}
+
+// clientTV is the TVHTML5 InnerTube client (client ID 7).
+//
+// This is the primary client.  It is the least likely to be bot-checked by
+// YouTube because it resembles a legitimate Smart TV app.  Its stream URLs
+// come wrapped in a signatureCipher field that is decoded on the fly by the
+// EJS sig-challenge solver.
+var clientTV = innertubeClientConfig{
+	context: map[string]interface{}{
+		"clientName":    "TVHTML5",
+		"clientVersion": "7.20260114.12.00",
+		"userAgent":     "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
+	},
+	clientNameID:     "7",
+	clientVersion:    "7.20260114.12.00",
+	userAgent:        "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
+	requiresJSPlayer: true,
 }
 
 // clientAndroidVR is the ANDROID_VR InnerTube client (client ID 28).
 //
-// This is the preferred client because it returns direct stream URLs without
-// requiring proof-of-origin tokens.  However, YouTube may return
-// "Sign in to confirm you're not a bot" for some videos when using this
-// client.  In that case the code falls back to clientIOS.
+// Returns direct stream URLs (no signature cipher).  Used as a fallback when
+// the tv client is unavailable.
 var clientAndroidVR = innertubeClientConfig{
 	context: map[string]interface{}{
 		"clientName":        "ANDROID_VR",
@@ -122,9 +138,7 @@ var clientAndroidVR = innertubeClientConfig{
 
 // clientIOS is the IOS InnerTube client (client ID 5).
 //
-// Like android_vr it has REQUIRE_JS_PLAYER=False (direct stream URLs), and
-// it is significantly less likely to be bot-checked by YouTube.  It is used
-// as a fallback when android_vr is rejected.
+// Returns direct stream URLs (no signature cipher).  Used as a final fallback.
 var clientIOS = innertubeClientConfig{
 	context: map[string]interface{}{
 		"clientName":    "IOS",
@@ -141,8 +155,9 @@ var clientIOS = innertubeClientConfig{
 }
 
 // defaultClients is the ordered list of InnerTube clients tried by GetURL.
-// android_vr is attempted first; ios is the fallback.
-var defaultClients = []innertubeClientConfig{clientAndroidVR, clientIOS}
+// tv (TVHTML5) is tried first because it avoids bot-check rejections.
+// android_vr and ios are fallbacks that return direct (non-ciphered) URLs.
+var defaultClients = []innertubeClientConfig{clientTV, clientAndroidVR, clientIOS}
 
 // playerURLRe matches the player JavaScript URL embedded in the YouTube
 // watch-page HTML, e.g. /s/player/HASH/player_ias.vflset/en_US/base.js
@@ -274,11 +289,9 @@ func (d *Downloader) getURLWithClient(videoID string, mediaType MediaType, clien
 	sortFormats(fmts, mediaType)
 	best := fmts[0]
 
-	streamURL, err := d.solveNChallenge(videoID, best.URL)
+	streamURL, err := d.resolveFormatURL(videoID, best)
 	if err != nil {
-		// Return the un-throttled URL rather than failing completely so that
-		// callers can still use it (albeit at potentially reduced speed).
-		return best.URL, nil
+		return "", fmt.Errorf("resolve stream URL: %w", err)
 	}
 	return streamURL, nil
 }
@@ -369,24 +382,25 @@ func (d *Downloader) fetchPlayerResponse(videoID string, client innertubeClientC
 
 // internalFormat is a normalised representation used for sorting.
 type internalFormat struct {
-	URL          string
-	MimeType     string
-	Bitrate      int
-	Height       int
-	AudioQuality string
+	URL             string
+	SignatureCipher string // non-empty when the stream URL requires sig deciphering
+	MimeType        string
+	Bitrate         int
+	Height          int
+	AudioQuality    string
 }
 
 // collectFormats extracts the relevant stream formats from a player response.
 //
 // For MediaTypeVideo it returns adaptive video-only streams.
 // For MediaTypeAudio it returns adaptive audio-only streams.
-// Formats that require a signature cipher (not provided by the android_vr
-// client) or that have no direct URL are silently skipped.
+// Formats with either a direct URL or a signatureCipher are included.
+// Formats with neither are silently skipped.
 func collectFormats(pr *playerResponse, mediaType MediaType) []internalFormat {
 	var out []internalFormat
 	for _, f := range pr.StreamingData.AdaptiveFormats {
-		if f.URL == "" {
-			continue // requires cipher; skip
+		if f.URL == "" && f.SignatureCipher == "" {
+			continue // no usable URL; skip
 		}
 		mime := strings.ToLower(f.MimeType)
 		switch mediaType {
@@ -400,11 +414,12 @@ func collectFormats(pr *playerResponse, mediaType MediaType) []internalFormat {
 			}
 		}
 		out = append(out, internalFormat{
-			URL:          f.URL,
-			MimeType:     f.MimeType,
-			Bitrate:      f.effectiveBitrate(),
-			Height:       f.Height,
-			AudioQuality: f.AudioQuality,
+			URL:             f.URL,
+			SignatureCipher: f.SignatureCipher,
+			MimeType:        f.MimeType,
+			Bitrate:         f.effectiveBitrate(),
+			Height:          f.Height,
+			AudioQuality:    f.AudioQuality,
 		})
 	}
 	return out
@@ -427,8 +442,108 @@ func sortFormats(fmts []internalFormat, mediaType MediaType) {
 }
 
 // -----------------------------------------------------------------------
-// n-challenge solving
+// URL challenge solving
 // -----------------------------------------------------------------------
+
+// resolveFormatURL returns the playable URL for a stream format, solving any
+// signature cipher and/or n-throttle challenge as needed.
+//
+// For formats with a direct URL (android_vr, ios clients) only the n-challenge
+// is relevant.  For formats with a signatureCipher (tv client) the signature
+// is decoded first, then the n-challenge is applied to the resulting URL.
+func (d *Downloader) resolveFormatURL(videoID string, f internalFormat) (string, error) {
+	streamURL := f.URL
+
+	if f.SignatureCipher != "" {
+		resolved, err := d.resolveSigCipher(videoID, f.SignatureCipher)
+		if err != nil {
+			return "", fmt.Errorf("resolve sig cipher: %w", err)
+		}
+		streamURL = resolved
+	}
+
+	solved, err := d.solveNChallenge(videoID, streamURL)
+	if err != nil {
+		// Return the un-throttled URL rather than failing completely.
+		return streamURL, nil
+	}
+	return solved, nil
+}
+
+// parsedSignatureCipher holds the components extracted from a stream's
+// signatureCipher field.
+type parsedSignatureCipher struct {
+	streamURL string // base stream URL
+	cipher    string // the ciphered signature value (the "s" parameter)
+	sigParam  string // query parameter name for the solved sig (usually "sig")
+}
+
+// parseSignatureCipher parses the URL-encoded signatureCipher field that
+// YouTube embeds in stream formats returned by clients such as TVHTML5.
+//
+// The field is a query string of the form:
+//
+//	url=<encoded-url>&s=<ciphered-sig>&sp=<param-name>
+func parseSignatureCipher(sc string) (*parsedSignatureCipher, error) {
+	vals, err := url.ParseQuery(sc)
+	if err != nil {
+		return nil, fmt.Errorf("parse signatureCipher: %w", err)
+	}
+	streamURL := vals.Get("url")
+	if streamURL == "" {
+		return nil, fmt.Errorf("signatureCipher missing 'url' field")
+	}
+	cipher := vals.Get("s")
+	if cipher == "" {
+		return nil, fmt.Errorf("signatureCipher missing 's' field")
+	}
+	sigParam := vals.Get("sp")
+	if sigParam == "" {
+		sigParam = "sig" // YouTube default
+	}
+	return &parsedSignatureCipher{
+		streamURL: streamURL,
+		cipher:    cipher,
+		sigParam:  sigParam,
+	}, nil
+}
+
+// resolveSigCipher decodes a signatureCipher field into a direct stream URL
+// by using the EJS script to solve the sig challenge.
+func (d *Downloader) resolveSigCipher(videoID, signatureCipher string) (string, error) {
+	psc, err := parseSignatureCipher(signatureCipher)
+	if err != nil {
+		return "", err
+	}
+
+	playerURL, err := d.fetchPlayerURL(videoID)
+	if err != nil {
+		return "", fmt.Errorf("fetch player URL for sig: %w", err)
+	}
+	playerJS, err := d.fetchPlayerJS(playerURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch player JS for sig: %w", err)
+	}
+
+	results, err := d.runEJS(playerURL, playerJS, "sig", []string{psc.cipher})
+	if err != nil {
+		return "", fmt.Errorf("EJS sig challenge: %w", err)
+	}
+	solved, ok := results[psc.cipher]
+	if !ok || solved == "" {
+		return "", fmt.Errorf("EJS returned no result for sig challenge")
+	}
+
+	// Append the solved signature to the stream URL.
+	u, parseErr := url.Parse(psc.streamURL)
+	if parseErr != nil {
+		return "", fmt.Errorf("parse stream URL from signatureCipher: %w", parseErr)
+	}
+	q := u.Query()
+	q.Set(psc.sigParam, solved)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
 
 // solveNChallenge checks whether streamURL contains a YouTube n-throttle
 // parameter and, if so, uses the EJS script to transform it into an
@@ -455,7 +570,7 @@ func (d *Downloader) solveNChallenge(videoID, streamURL string) (string, error) 
 		return "", fmt.Errorf("fetch player JS: %w", err)
 	}
 
-	results, err := d.runEJS(playerURL, playerJS, nParam)
+	results, err := d.runEJS(playerURL, playerJS, "n", []string{nParam})
 	if err != nil {
 		return "", fmt.Errorf("EJS n-challenge: %w", err)
 	}
@@ -570,17 +685,17 @@ type ejsResponse struct {
 	Data  map[string]string `json:"data,omitempty"`
 }
 
-// runEJS calls the jsc() function from the EJS core script to solve the
-// n-throttle challenge for the given challenge string.  It returns a map of
-// challenge → solved value.
+// runEJS calls the jsc() function from the EJS core script to solve one or
+// more challenges of the given type ("n" or "sig").  It returns a map of
+// challenge value → solved value.
 //
 // runEJS is safe to call concurrently; it serialises access to the goja VM
 // with a mutex.
-func (d *Downloader) runEJS(playerURL, playerJS, nChallenge string) (map[string]string, error) {
+func (d *Downloader) runEJS(playerURL, playerJS, challengeType string, challenges []string) (map[string]string, error) {
 	// Build the input JSON.
 	var input ejsInput
 	input.Requests = []ejsRequest{
-		{Type: "n", Challenges: []string{nChallenge}},
+		{Type: challengeType, Challenges: challenges},
 	}
 
 	if cached, ok := d.preprocessedCache.Load(playerURL); ok {
@@ -638,7 +753,7 @@ func (d *Downloader) runEJS(playerURL, playerJS, nChallenge string) (map[string]
 
 	resp := output.Responses[0]
 	if resp.Type == "error" {
-		return nil, fmt.Errorf("EJS n-challenge error: %s", resp.Error)
+		return nil, fmt.Errorf("EJS %s-challenge error: %s", challengeType, resp.Error)
 	}
 
 	return resp.Data, nil

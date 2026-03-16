@@ -105,13 +105,15 @@ func TestCollectFormats_VideoOnly(t *testing.T) {
 		{URL: "https://example.com/v1", MimeType: "video/mp4", Bitrate: 1_000_000, Height: 720},
 		{URL: "https://example.com/a1", MimeType: "audio/mp4", Bitrate: 128_000},
 		{URL: "https://example.com/v2", MimeType: "video/webm", Bitrate: 2_000_000, Height: 1080},
-		// No URL – should be skipped.
+		// No URL and no signatureCipher – should be skipped.
 		{URL: "", MimeType: "video/mp4", Bitrate: 500_000, Height: 480},
+		// Has signatureCipher but no direct URL – should be included.
+		{SignatureCipher: "url=https%3A%2F%2Fexample.com%2Fv3&s=CIPHER&sp=sig", MimeType: "video/mp4", Bitrate: 1_500_000, Height: 720},
 	}
 
 	fmts := collectFormats(pr, MediaTypeVideo)
-	if len(fmts) != 2 {
-		t.Fatalf("expected 2 video formats, got %d", len(fmts))
+	if len(fmts) != 3 {
+		t.Fatalf("expected 3 video formats, got %d", len(fmts))
 	}
 	for _, f := range fmts {
 		if !strings.HasPrefix(strings.ToLower(f.MimeType), "video/") {
@@ -218,7 +220,7 @@ func TestRunEJS_NChallengeStub(t *testing.T) {
 	}
 
 	const challenge = "ABCxyz"
-	results, err := dl.runEJS("https://example.com/player.js", "// fake player JS", challenge)
+	results, err := dl.runEJS("https://example.com/player.js", "// fake player JS", "n", []string{challenge})
 	if err != nil {
 		t.Fatalf("runEJS: %v", err)
 	}
@@ -391,5 +393,174 @@ func TestGetURL_UnavailableVideo(t *testing.T) {
 	_, err := dl.GetURL("badVideoID", MediaTypeVideo)
 	if err == nil {
 		t.Fatal("expected error for unavailable video, got nil")
+	}
+}
+
+// -----------------------------------------------------------------------
+// Unit tests for sig-cipher helpers
+// -----------------------------------------------------------------------
+
+func TestParseSignatureCipher_Valid(t *testing.T) {
+	rawURL := "https://rr1.example.com/videoplayback?expire=99999&itag=137"
+	sc := "url=" + url.QueryEscape(rawURL) + "&s=CIPHERSIG&sp=sig"
+
+	psc, err := parseSignatureCipher(sc)
+	if err != nil {
+		t.Fatalf("parseSignatureCipher: %v", err)
+	}
+	if psc.streamURL != rawURL {
+		t.Errorf("streamURL: got %q, want %q", psc.streamURL, rawURL)
+	}
+	if psc.cipher != "CIPHERSIG" {
+		t.Errorf("cipher: got %q, want %q", psc.cipher, "CIPHERSIG")
+	}
+	if psc.sigParam != "sig" {
+		t.Errorf("sigParam: got %q, want %q", psc.sigParam, "sig")
+	}
+}
+
+func TestParseSignatureCipher_DefaultSigParam(t *testing.T) {
+	// When "sp" is absent the default "sig" should be used.
+	rawURL := "https://rr1.example.com/videoplayback"
+	sc := "url=" + url.QueryEscape(rawURL) + "&s=XYZ"
+
+	psc, err := parseSignatureCipher(sc)
+	if err != nil {
+		t.Fatalf("parseSignatureCipher: %v", err)
+	}
+	if psc.sigParam != "sig" {
+		t.Errorf("sigParam: got %q, want default %q", psc.sigParam, "sig")
+	}
+}
+
+func TestParseSignatureCipher_MissingURL(t *testing.T) {
+	_, err := parseSignatureCipher("s=CIPHERSIG&sp=sig")
+	if err == nil {
+		t.Fatal("expected error when 'url' field is absent")
+	}
+}
+
+func TestParseSignatureCipher_MissingS(t *testing.T) {
+	_, err := parseSignatureCipher("url=" + url.QueryEscape("https://example.com") + "&sp=sig")
+	if err == nil {
+		t.Fatal("expected error when 's' field is absent")
+	}
+}
+
+// TestGetURL_SigCipherFormat verifies that GetURL can handle a format whose
+// URL is delivered via a signatureCipher field (as the tv client produces).
+// The mock player endpoint returns a response where the only adaptive format
+// uses signatureCipher.  The stub EJS script reverses the cipher value; the
+// test checks that the resolved URL contains the expected reversed sig.
+func TestGetURL_SigCipherFormat(t *testing.T) {
+	const (
+		rawStreamURL  = "https://rr1.example.com/videoplayback?expire=99999&itag=137"
+		cipherValue   = "CIPHERSIG123"
+		sigParamName  = "sig"
+	)
+
+	sc := "url=" + url.QueryEscape(rawStreamURL) + "&s=" + cipherValue + "&sp=" + sigParamName
+
+	playerResp := map[string]interface{}{
+		"playabilityStatus": map[string]interface{}{"status": "OK"},
+		"streamingData": map[string]interface{}{
+			"adaptiveFormats": []map[string]interface{}{
+				{
+					"itag":            137,
+					"signatureCipher": sc,
+					"mimeType":        "video/mp4; codecs=\"avc1.640028\"",
+					"bitrate":         3_000_000,
+					"width":           1920,
+					"height":          1080,
+					"qualityLabel":    "1080p",
+				},
+			},
+		},
+	}
+	playerRespJSON, _ := json.Marshal(playerResp)
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/youtubei/v1/player", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(playerRespJSON)
+	})
+	mux.HandleFunc("/watch", func(w http.ResponseWriter, r *http.Request) {
+		page := `<html><body><script>var x = "/s/player/abc12345/player_ias.vflset/en_US/base.js"</script></body></html>`
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(page))
+	})
+	mux.HandleFunc("/s/player/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte("// fake player JS"))
+	})
+
+	dl := buildTestDownloader(t, mux)
+
+	got, err := dl.GetURL("testVideoID", MediaTypeVideo)
+	if err != nil {
+		t.Fatalf("GetURL: %v", err)
+	}
+
+	// The stub EJS reverses the cipher: "CIPHERSIG123" → "321GISREHPIC".
+	// Expect ?sig=321GISREHPIC in the resolved URL.
+	want := "321GISREHPIC"
+	if !strings.Contains(got, sigParamName+"="+want) {
+		t.Errorf("expected %s=%s in resolved URL, got %q", sigParamName, want, got)
+	}
+}
+
+// TestGetURL_TVClientFallback verifies that when the tv client is rejected
+// (non-OK playability status) GetURL falls back to android_vr which succeeds.
+func TestGetURL_TVClientFallback(t *testing.T) {
+	callCount := 0
+
+	// OK response with a direct URL (android_vr / ios style).
+	okResp := map[string]interface{}{
+		"playabilityStatus": map[string]interface{}{"status": "OK"},
+		"streamingData": map[string]interface{}{
+			"adaptiveFormats": []map[string]interface{}{
+				{
+					"itag":     137,
+					"url":      "https://rr1.example.com/videoplayback?expire=99999&itag=137",
+					"mimeType": "video/mp4; codecs=\"avc1.640028\"",
+					"bitrate":  3_000_000,
+					"height":   1080,
+				},
+			},
+		},
+	}
+	okRespJSON, _ := json.Marshal(okResp)
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/youtubei/v1/player", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		callCount++
+		if callCount == 1 {
+			// First call (tv client) – simulate bot-check rejection.
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"playabilityStatus": map[string]interface{}{
+					"status": "ERROR",
+					"reason": "Sign in to confirm you're not a bot",
+				},
+			})
+			return
+		}
+		// Subsequent calls (android_vr, ios) – succeed.
+		_, _ = w.Write(okRespJSON)
+	})
+
+	dl := buildTestDownloader(t, mux)
+
+	got, err := dl.GetURL("botVideoID", MediaTypeVideo)
+	if err != nil {
+		t.Fatalf("GetURL: %v (callCount=%d)", err, callCount)
+	}
+	if !strings.Contains(got, "itag=137") {
+		t.Errorf("expected itag=137 in URL, got %q", got)
+	}
+	if callCount < 2 {
+		t.Errorf("expected at least 2 /player calls (tv + fallback), got %d", callCount)
 	}
 }

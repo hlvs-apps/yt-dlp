@@ -8,8 +8,13 @@ the content is left entirely to the caller.
 
 * Selects the **highest-quality video** or **highest-quality audio** adaptive
   stream.
-* Uses the `android_vr` InnerTube client which returns **direct URLs**
-  (no signature cipher to decrypt).
+* Uses the **`tv` (TVHTML5) InnerTube client** as the primary client.  This
+  client is the least likely to be bot-checked by YouTube.  Its stream URLs
+  are delivered as a `signatureCipher` which the library automatically decodes
+  using the EJS sig-challenge solver.
+* Falls back to `android_vr` and then `ios` clients automatically if the `tv`
+  client is unavailable for a particular video (both return direct URLs without
+  signature cipher).
 * Solves the **n-throttle challenge** using the
   [yt-dlp EJS solver script](https://github.com/yt-dlp/ejs/releases) and the
   embedded [goja](https://github.com/dop251/goja) JavaScript engine.
@@ -95,9 +100,13 @@ Returns the URL of the highest-quality stream of the requested type.
 * `videoID` – the 11-character YouTube video ID (e.g. `"dQw4w9WgXcQ"`).
 * `mediaType` – `ytdl.MediaTypeVideo` or `ytdl.MediaTypeAudio`.
 
-When the stream URL contains an n-throttle parameter, `GetURL` automatically
-fetches the YouTube player JavaScript and uses the EJS script to transform it,
-returning a de-throttled URL.
+When the stream URL requires signature-cipher decoding (tv client) or contains
+an n-throttle parameter, `GetURL` automatically fetches the YouTube player
+JavaScript and uses the EJS script to resolve both, returning a fully playable
+URL.
+
+`GetURL` tries multiple InnerTube clients in order (`tv` → `android_vr` →
+`ios`) and returns the first successful result.
 
 ### `Options`
 
@@ -131,6 +140,9 @@ const (
 
 * This library performs outbound HTTPS requests to `www.youtube.com`.  Ensure
   your environment allows these connections.
-* The `android_vr` InnerTube client does not require authentication or
-  proof-of-origin tokens for most public videos.
+* The `tv` (TVHTML5) InnerTube client is used by default.  It avoids
+  bot-check rejections that can occur with the `android_vr` client.
+  Signature-cipher decoding is handled transparently via the EJS script.
+* `android_vr` and `ios` clients (which return direct URLs) are used as
+  automatic fallbacks if the `tv` client is unavailable for a video.
 * Age-restricted or otherwise unavailable videos will return an error.
