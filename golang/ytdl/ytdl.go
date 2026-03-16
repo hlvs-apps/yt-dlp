@@ -1,5 +1,5 @@
 // Package ytdl provides YouTube stream URL extraction using the yt-dlp EJS
-// challenge solver script and the goja JavaScript engine.
+// challenge solver script and an embedded QuickJS engine.
 //
 // Usage:
 //
@@ -23,7 +23,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dop251/goja"
+	quickjs "github.com/rosbit/go-quickjs"
 
 	_ "embed"
 )
@@ -64,12 +64,10 @@ type Options struct {
 
 // Downloader extracts YouTube stream URLs.
 //
-// A single Downloader instance is safe to use from multiple goroutines; an
-// internal mutex serialises access to the embedded goja JavaScript runtime.
+// A single Downloader instance is safe to use from multiple goroutines;
+// the embedded QuickJS context has its own internal mutex.
 type Downloader struct {
-	vm      *goja.Runtime
-	jscFunc goja.Callable
-	jsMu    sync.Mutex
+	js *quickjs.JsContext
 
 	httpClient *http.Client
 
@@ -185,37 +183,31 @@ func NewDownloader() (*Downloader, error) {
 // NewDownloaderWithOptions is like [NewDownloader] but accepts additional
 // [Options].
 func NewDownloaderWithOptions(opts Options) (*Downloader, error) {
-	vm := goja.New()
-
-	// Expose globalThis so that UMD bundles that use it can find the global
-	// object even in older versions of goja.
-	if err := vm.Set("globalThis", vm.GlobalObject()); err != nil {
-		return nil, fmt.Errorf("ytdl: set globalThis: %w", err)
+	js, err := quickjs.NewContext()
+	if err != nil {
+		return nil, fmt.Errorf("ytdl: create QuickJS context: %w", err)
 	}
 
 	// Load the meriyah UMD bundle → sets globalThis.meriyah
-	if _, err := vm.RunString(string(meriyahJS)); err != nil {
+	if _, err := js.Eval(string(meriyahJS), nil); err != nil {
 		return nil, fmt.Errorf("ytdl: load meriyah: %w", err)
 	}
 
 	// Load the astring bundle → sets globalThis.astring
-	if _, err := vm.RunString(string(astringJS)); err != nil {
+	if _, err := js.Eval(string(astringJS), nil); err != nil {
 		return nil, fmt.Errorf("ytdl: load astring: %w", err)
 	}
 
 	// Load the EJS core script → defines globalThis.jsc using the global
 	// meriyah and astring objects.
-	if _, err := vm.RunString(string(ejsCoreJS)); err != nil {
+	if _, err := js.Eval(string(ejsCoreJS), nil); err != nil {
 		return nil, fmt.Errorf("ytdl: load EJS script: %w", err)
 	}
 
-	jscVal := vm.Get("jsc")
-	if jscVal == nil || goja.IsUndefined(jscVal) || goja.IsNull(jscVal) {
+	// Verify that the EJS script exported the expected jsc function.
+	jscVal, err := js.GetGlobal("jsc")
+	if err != nil || jscVal == nil {
 		return nil, fmt.Errorf("ytdl: EJS script did not export a 'jsc' function")
-	}
-	jscFunc, ok := goja.AssertFunction(jscVal)
-	if !ok {
-		return nil, fmt.Errorf("ytdl: 'jsc' is not a callable function")
 	}
 
 	client := opts.HTTPClient
@@ -224,8 +216,7 @@ func NewDownloaderWithOptions(opts Options) (*Downloader, error) {
 	}
 
 	return &Downloader{
-		vm:         vm,
-		jscFunc:    jscFunc,
+		js:         js,
 		httpClient: client,
 	}, nil
 }
@@ -689,8 +680,8 @@ type ejsResponse struct {
 // more challenges of the given type ("n" or "sig").  It returns a map of
 // challenge value → solved value.
 //
-// runEJS is safe to call concurrently; it serialises access to the goja VM
-// with a mutex.
+// runEJS is safe to call concurrently; the QuickJS context serialises
+// concurrent access internally.
 func (d *Downloader) runEJS(playerURL, playerJS, challengeType string, challenges []string) (map[string]string, error) {
 	// Build the input JSON.
 	var input ejsInput
@@ -712,23 +703,15 @@ func (d *Downloader) runEJS(playerURL, playerJS, challengeType string, challenge
 		return nil, fmt.Errorf("marshal EJS input: %w", err)
 	}
 
-	// Serialise access to the goja runtime.
-	d.jsMu.Lock()
-	defer d.jsMu.Unlock()
-
-	// Parse the input JSON into a goja value and call jsc().
-	inputVal, err := d.vm.RunString("(" + string(inputJSON) + ")")
-	if err != nil {
-		return nil, fmt.Errorf("parse EJS input in VM: %w", err)
-	}
-
-	result, err := d.jscFunc(goja.Undefined(), inputVal)
+	// Call jsc(input) inside QuickJS.  The context's internal mutex
+	// serialises concurrent calls.
+	result, err := d.js.Eval("jsc("+string(inputJSON)+")", nil)
 	if err != nil {
 		return nil, fmt.Errorf("jsc() call failed: %w", err)
 	}
 
 	// Serialise the result back to JSON for easy Go-side handling.
-	resultJSON, err := json.Marshal(result.Export())
+	resultJSON, err := json.Marshal(result)
 	if err != nil {
 		return nil, fmt.Errorf("marshal EJS output: %w", err)
 	}

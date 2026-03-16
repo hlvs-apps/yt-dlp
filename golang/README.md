@@ -21,6 +21,10 @@ the content is left entirely to the caller.
 * The `yt.solver.core.js` script and the `meriyah` / `astring` JavaScript
   libraries it depends on are all **embedded in the binary** via `go:embed`.
   No Node.js runtime or external script file is required.
+* JavaScript execution uses **[QuickJS](https://bellard.org/quickjs/)** via
+  the [`go-quickjs`](https://github.com/rosbit/go-quickjs) CGO binding.
+  QuickJS is a fast, lightweight C engine — significantly faster than a
+  pure-Go JS interpreter for the heavy parsing work done by the EJS solver.
 * Safe for concurrent use from multiple goroutines.
 
 ## Requirements
@@ -28,6 +32,12 @@ the content is left entirely to the caller.
 | Tool   | Version  |
 |--------|----------|
 | Go     | ≥ 1.21   |
+| C compiler (CGO) | gcc / clang |
+
+A C compiler is required because `go-quickjs` compiles QuickJS from its
+bundled C source files.  On most Linux distributions this is provided by the
+`gcc` or `clang` package.  On macOS it is included with Xcode Command Line
+Tools.
 
 ## Installation
 
@@ -72,8 +82,8 @@ func main() {
 
 ### `NewDownloader() (*Downloader, error)`
 
-Initialises the goja JavaScript runtime with the embedded `yt.solver.core.js`,
-`meriyah`, and `astring` libraries and returns a ready-to-use `Downloader`.
+Initialises a QuickJS context and loads the embedded `yt.solver.core.js`,
+`meriyah`, and `astring` libraries, then returns a ready-to-use `Downloader`.
 No external files or paths are required.
 
 ### `NewDownloaderWithOptions(opts Options) (*Downloader, error)`
