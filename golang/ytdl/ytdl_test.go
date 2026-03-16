@@ -197,10 +197,10 @@ w.Header().Set("Content-Type", "application/json")
 _, _ = w.Write(playerResponseJSON)
 })
 
-// YouTube watch page – contains a player JS URL.
+// YouTube watch page – contains a player JS URL and VISITOR_DATA in ytcfg.
 mux.HandleFunc("/watch", func(w http.ResponseWriter, r *http.Request) {
 page := `<html><body>
-<script>var ytcfg = {"PLAYER_JS_URL":"/s/player/abc12345/player_ias.vflset/en_US/base.js"};</script>
+<script>ytcfg.set({"PLAYER_JS_URL":"/s/player/abc12345/player_ias.vflset/en_US/base.js","VISITOR_DATA":"CgtTestVisitorXYZ"});</script>
 </body></html>`
 w.Header().Set("Content-Type", "text/html")
 _, _ = w.Write([]byte(page))
@@ -404,5 +404,76 @@ t.Errorf("expected itag=137 in URL, got %q", got)
 }
 if callCount < 2 {
 t.Errorf("expected at least 2 /player calls (tv + fallback), got %d", callCount)
+}
+}
+
+// TestGetURL_RequestHeaders verifies that the InnerTube /player POST carries
+// the exact header names and values that the Python yt-dlp implementation
+// sends (X-YouTube-Client-Name, Origin, X-Goog-Visitor-Id).
+func TestGetURL_RequestHeaders(t *testing.T) {
+var capturedHeaders http.Header
+
+okResp := map[string]interface{}{
+"playabilityStatus": map[string]interface{}{"status": "OK"},
+"streamingData": map[string]interface{}{
+"adaptiveFormats": []map[string]interface{}{
+{
+"itag":     137,
+"url":      "https://rr1.example.com/videoplayback?expire=99999&itag=137",
+"mimeType": "video/mp4; codecs=\"avc1.640028\"",
+"bitrate":  3_000_000,
+"height":   1080,
+},
+},
+},
+}
+okRespJSON, _ := json.Marshal(okResp)
+
+mux := http.NewServeMux()
+
+mux.HandleFunc("/youtubei/v1/player", func(w http.ResponseWriter, r *http.Request) {
+capturedHeaders = r.Header.Clone()
+w.Header().Set("Content-Type", "application/json")
+_, _ = w.Write(okRespJSON)
+})
+
+mux.HandleFunc("/watch", func(w http.ResponseWriter, r *http.Request) {
+page := `<html><body>
+<script>ytcfg.set({"VISITOR_DATA":"CgtHeaderTestVisitor"});</script>
+<script>var x="/s/player/abc12345/player_ias.vflset/en_US/base.js";</script>
+</body></html>`
+w.Header().Set("Content-Type", "text/html")
+_, _ = w.Write([]byte(page))
+})
+
+mux.HandleFunc("/s/player/", func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Content-Type", "application/javascript")
+_, _ = w.Write([]byte("// fake player JS"))
+})
+
+dl := buildTestDownloader(t, mux)
+
+if _, err := dl.GetURL("headerVideoID", MediaTypeVideo); err != nil {
+t.Fatalf("GetURL: %v", err)
+}
+
+if capturedHeaders == nil {
+t.Fatal("no /player request was made")
+}
+
+// Header casing must match Python's generate_api_headers() exactly.
+if v := capturedHeaders.Get("X-YouTube-Client-Name"); v == "" {
+t.Error("X-YouTube-Client-Name header missing or empty")
+}
+if v := capturedHeaders.Get("X-YouTube-Client-Version"); v == "" {
+t.Error("X-YouTube-Client-Version header missing or empty")
+}
+// Origin is required for InnerTube CORS policy.
+if v := capturedHeaders.Get("Origin"); v != youtubeBaseURL {
+t.Errorf("Origin header = %q, want %q", v, youtubeBaseURL)
+}
+// Visitor data extracted from ytcfg should be forwarded.
+if v := capturedHeaders.Get("X-Goog-Visitor-Id"); v != "CgtHeaderTestVisitor" {
+t.Errorf("X-Goog-Visitor-Id = %q, want %q", v, "CgtHeaderTestVisitor")
 }
 }

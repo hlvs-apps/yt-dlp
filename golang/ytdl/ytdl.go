@@ -75,6 +75,12 @@ type Downloader struct {
 
 	httpClient *http.Client
 
+	// visitorData is the Goog Visitor ID extracted from the YouTube watch-page
+	// ytcfg and sent as X-Goog-Visitor-Id on every InnerTube request.
+	// Protected by visitorMu; written once (first watch-page fetch).
+	visitorData string
+	visitorMu   sync.Mutex
+
 	// playerJSCache maps a player URL to the downloaded player JavaScript
 	// source, avoiding repeated HTTP fetches for the same player version.
 	playerJSCache sync.Map // map[string]string
@@ -197,6 +203,14 @@ var defaultClients = []innertubeClientConfig{clientTV, clientAndroidVR, clientIO
 // watch-page HTML, e.g. /s/player/HASH/player_ias.vflset/en_US/base.js
 var playerURLRe = regexp.MustCompile(`/s/player/[a-zA-Z0-9_-]+/[^\s"'\\]+\.js`)
 
+// visitorDataRe extracts the VISITOR_DATA value from the ytcfg JSON embedded
+// in the YouTube watch page (or TV page) HTML.  YouTube embeds it as a plain
+// JSON string value, e.g. "VISITOR_DATA":"CgtXXX...".
+var visitorDataRe = regexp.MustCompile(`"VISITOR_DATA"\s*:\s*"([^"]+)"`)
+
+// youtubeBaseURL is the base URL used for Origin and cookie initialisation.
+const youtubeBaseURL = "https://www.youtube.com"
+
 // -----------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------
@@ -246,6 +260,15 @@ func NewDownloaderWithOptions(opts Options) (*Downloader, error) {
 	client := opts.HTTPClient
 	if client == nil {
 		jar, _ := cookiejar.New(nil)
+		// Mirror Python's _initialize_consent() and _initialize_pref():
+		// set SOCS=CAI (accept all cookies, required for mixes) and
+		// PREF=hl=en&tz=UTC before any outbound request so that YouTube does
+		// not redirect to the consent gate or return localised responses.
+		ytURL, _ := url.Parse(youtubeBaseURL)
+		jar.SetCookies(ytURL, []*http.Cookie{
+			{Name: "SOCS", Value: "CAI", Domain: ".youtube.com", Path: "/", Secure: true},
+			{Name: "PREF", Value: "hl=en&tz=UTC", Domain: ".youtube.com", Path: "/"},
+		})
 		client = &http.Client{Jar: jar}
 	}
 
@@ -295,13 +318,15 @@ func (d *Downloader) GetURL(videoID string, mediaType MediaType) (string, error)
 
 // getURLWithClient is the per-client implementation called by GetURL.
 func (d *Downloader) getURLWithClient(videoID string, mediaType MediaType, client innertubeClientConfig) (string, error) {
-	// For clients that need the JS player (TV, WEB) pre-fetch the watch page
-	// now, before the InnerTube POST, so that YouTube session cookies are
-	// already in the jar when the API request is made.
-	if client.requiresJSPlayer {
-		if _, err := d.fetchPlayerURL(videoID); err != nil {
-			log.Printf("ytdl: pre-fetch watch page for cookie jar: %v", err)
-		}
+	// Always pre-fetch the watch page before the InnerTube POST so that:
+	//   1. YouTube session cookies (from Set-Cookie headers) are in the jar.
+	//   2. The visitor data (VISITOR_DATA from ytcfg) is extracted and will
+	//      be sent as X-Goog-Visitor-Id on the API request.
+	// This matches the behaviour of the Python yt-dlp implementation which
+	// fetches ytcfg from the watch / TV page for every client before calling
+	// the player API.
+	if _, err := d.fetchPlayerURL(videoID); err != nil {
+		log.Printf("ytdl: pre-fetch watch page for cookie jar: %v", err)
 	}
 
 	pr, err := d.fetchPlayerResponse(videoID, client)
@@ -392,8 +417,19 @@ func (d *Downloader) fetchPlayerResponse(videoID string, client innertubeClientC
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", client.userAgent)
-	req.Header.Set("X-Youtube-Client-Name", client.clientNameID)
-	req.Header.Set("X-Youtube-Client-Version", client.clientVersion)
+	// Header names must match Python yt-dlp's generate_api_headers() exactly.
+	req.Header.Set("X-YouTube-Client-Name", client.clientNameID)
+	req.Header.Set("X-YouTube-Client-Version", client.clientVersion)
+	req.Header.Set("Origin", youtubeBaseURL)
+	// Send the visitor data extracted from the watch-page ytcfg so that
+	// YouTube's servers can correlate this request with a known browser
+	// session.  Without this header YouTube may flag the request as a bot.
+	d.visitorMu.Lock()
+	vd := d.visitorData
+	d.visitorMu.Unlock()
+	if vd != "" {
+		req.Header.Set("X-Goog-Visitor-Id", vd)
+	}
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
@@ -625,17 +661,23 @@ func (d *Downloader) solveNChallenge(videoID, streamURL string) (string, error) 
 // a given video by fetching the watch page and searching for the embedded
 // player path.  Results are cached by video ID so the watch page is fetched
 // at most once per video per Downloader lifetime.
+//
+// As a side effect, the first call also extracts the VISITOR_DATA value from
+// the ytcfg JSON embedded in the page (matching Python's extract_ytcfg /
+// _extract_visitor_data logic) and stores it for use in subsequent InnerTube
+// API requests as X-Goog-Visitor-Id.
 func (d *Downloader) fetchPlayerURL(videoID string) (string, error) {
 	if cached, ok := d.playerURLByVideo.Load(videoID); ok {
 		return cached.(string), nil
 	}
 
-	watchURL := "https://www.youtube.com/watch?v=" + url.QueryEscape(videoID)
+	watchURL := youtubeBaseURL + "/watch?v=" + url.QueryEscape(videoID)
 	req, err := http.NewRequest(http.MethodGet, watchURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("create watch request: %w", err)
 	}
-	// Use a desktop browser UA so that YouTube returns the full page.
+	// Use a desktop browser UA so that YouTube returns the full page with
+	// ytcfg, player URL, and proper Set-Cookie headers.
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
@@ -650,11 +692,22 @@ func (d *Downloader) fetchPlayerURL(videoID string) (string, error) {
 		return "", fmt.Errorf("read watch page: %w", err)
 	}
 
+	// Extract and cache visitor data (VISITOR_DATA from ytcfg) on the first
+	// successful fetch.  This mirrors Python's extract_ytcfg() +
+	// _extract_visitor_data() and is used as X-Goog-Visitor-Id.
+	d.visitorMu.Lock()
+	if d.visitorData == "" {
+		if m := visitorDataRe.FindSubmatch(data); len(m) == 2 {
+			d.visitorData = string(m[1])
+		}
+	}
+	d.visitorMu.Unlock()
+
 	match := playerURLRe.Find(data)
 	if match == nil {
 		return "", fmt.Errorf("player JS URL not found in watch page for video %q", videoID)
 	}
-	playerURL := "https://www.youtube.com" + string(match)
+	playerURL := youtubeBaseURL + string(match)
 	d.playerURLByVideo.Store(videoID, playerURL)
 	return playerURL, nil
 }
