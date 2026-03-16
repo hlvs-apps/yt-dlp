@@ -21,10 +21,12 @@ the content is left entirely to the caller.
 * The `yt.solver.core.js` script and the `meriyah` / `astring` JavaScript
   libraries it depends on are all **embedded in the binary** via `go:embed`.
   No Node.js runtime or external script file is required.
-* JavaScript execution uses **[QuickJS](https://bellard.org/quickjs/)** via
-  the [`go-quickjs`](https://github.com/rosbit/go-quickjs) CGO binding.
-  QuickJS is a fast, lightweight C engine — significantly faster than a
-  pure-Go JS interpreter for the heavy parsing work done by the EJS solver.
+* JavaScript execution uses **[V8](https://v8.dev/)** via the
+  [`v8go`](https://github.com/rogchap/v8go) CGO binding — the same V8 engine
+  that powers Chrome and Node.js.
+* The default `http.Client` is created with a **cookie jar** so that YouTube
+  consent/session cookies set during the watch-page fetch are automatically
+  replayed on subsequent requests, reducing bot-check rejections.
 * Safe for concurrent use from multiple goroutines.
 
 ## Requirements
@@ -34,10 +36,10 @@ the content is left entirely to the caller.
 | Go     | ≥ 1.21   |
 | C compiler (CGO) | gcc / clang |
 
-A C compiler is required because `go-quickjs` compiles QuickJS from its
-bundled C source files.  On most Linux distributions this is provided by the
-`gcc` or `clang` package.  On macOS it is included with Xcode Command Line
-Tools.
+A C compiler is required because `v8go` ships a pre-built V8 static library
+that is linked at CGO build time.  On most Linux distributions this is
+provided by the `gcc` or `clang` package.  On macOS it is included with
+Xcode Command Line Tools.
 
 ## Installation
 
@@ -82,8 +84,10 @@ func main() {
 
 ### `NewDownloader() (*Downloader, error)`
 
-Initialises a QuickJS context and loads the embedded `yt.solver.core.js`,
-`meriyah`, and `astring` libraries, then returns a ready-to-use `Downloader`.
+Initialises a V8 isolate and context and loads the embedded
+`yt.solver.core.js`, `meriyah`, and `astring` libraries, then returns a
+ready-to-use `Downloader`.  The default HTTP client is created with a cookie
+jar so YouTube session cookies are preserved across requests.
 No external files or paths are required.
 
 ### `NewDownloaderWithOptions(opts Options) (*Downloader, error)`

@@ -1,5 +1,5 @@
 // Package ytdl provides YouTube stream URL extraction using the yt-dlp EJS
-// challenge solver script and an embedded QuickJS engine.
+// challenge solver script and the v8go JavaScript engine.
 //
 // Usage:
 //
@@ -16,14 +16,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 
-	quickjs "github.com/rosbit/go-quickjs"
+	"rogchap.com/v8go"
 
 	_ "embed"
 )
@@ -64,16 +66,24 @@ type Options struct {
 
 // Downloader extracts YouTube stream URLs.
 //
-// A single Downloader instance is safe to use from multiple goroutines;
-// the embedded QuickJS context has its own internal mutex.
+// A single Downloader instance is safe to use from multiple goroutines; an
+// internal mutex serialises access to the embedded v8go JavaScript runtime.
 type Downloader struct {
-	js *quickjs.JsContext
+	iso  *v8go.Isolate
+	ctx  *v8go.Context
+	jsMu sync.Mutex
 
 	httpClient *http.Client
 
 	// playerJSCache maps a player URL to the downloaded player JavaScript
 	// source, avoiding repeated HTTP fetches for the same player version.
 	playerJSCache sync.Map // map[string]string
+
+	// playerURLByVideo maps a video ID to the player JavaScript URL found on
+	// the watch page.  This prevents fetching the watch page twice when it is
+	// pre-fetched to warm the cookie jar and then needed again for sig/n
+	// challenge solving.
+	playerURLByVideo sync.Map // map[string]string
 
 	// preprocessedCache maps a player URL to the JSON-serialisable
 	// preprocessed_player object returned by the EJS jsc() function after
@@ -158,10 +168,30 @@ var clientIOS = innertubeClientConfig{
 	userAgent:     "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
 }
 
+// clientWeb is the WEB InnerTube client (client ID 1).
+//
+// This is the standard desktop-browser client.  It requires a cookie jar to
+// avoid bot-check rejections, and its stream URLs need sig/n challenge
+// solving.  Used as an additional fallback.
+var clientWeb = innertubeClientConfig{
+	context: map[string]interface{}{
+		"clientName":    "WEB",
+		"clientVersion": "2.20250311.09.00",
+		"userAgent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"hl":            "en",
+		"gl":            "US",
+	},
+	clientNameID:     "1",
+	clientVersion:    "2.20250311.09.00",
+	userAgent:        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	requiresJSPlayer: true,
+}
+
 // defaultClients is the ordered list of InnerTube clients tried by GetURL.
 // tv (TVHTML5) is tried first because it avoids bot-check rejections.
 // android_vr and ios are fallbacks that return direct (non-ciphered) URLs.
-var defaultClients = []innertubeClientConfig{clientTV, clientAndroidVR, clientIOS}
+// web is a final fallback using the standard desktop-browser client.
+var defaultClients = []innertubeClientConfig{clientTV, clientAndroidVR, clientIOS, clientWeb}
 
 // playerURLRe matches the player JavaScript URL embedded in the YouTube
 // watch-page HTML, e.g. /s/player/HASH/player_ias.vflset/en_US/base.js
@@ -183,40 +213,45 @@ func NewDownloader() (*Downloader, error) {
 // NewDownloaderWithOptions is like [NewDownloader] but accepts additional
 // [Options].
 func NewDownloaderWithOptions(opts Options) (*Downloader, error) {
-	js, err := quickjs.NewContext()
-	if err != nil {
-		return nil, fmt.Errorf("ytdl: create QuickJS context: %w", err)
+	iso := v8go.NewIsolate()
+	ctx := v8go.NewContext(iso)
+
+	// Ensure globalThis is present for UMD bundles.
+	if _, err := ctx.RunScript("var globalThis = this;", "globalthis.js"); err != nil {
+		return nil, fmt.Errorf("ytdl: set globalThis: %w", err)
 	}
 
-	// Load the meriyah UMD bundle → sets globalThis.meriyah
-	if _, err := js.Eval(string(meriyahJS), nil); err != nil {
+	if _, err := ctx.RunScript(string(meriyahJS), "meriyah.umd.min.js"); err != nil {
 		return nil, fmt.Errorf("ytdl: load meriyah: %w", err)
 	}
-
-	// Load the astring bundle → sets globalThis.astring
-	if _, err := js.Eval(string(astringJS), nil); err != nil {
+	if _, err := ctx.RunScript(string(astringJS), "astring.min.js"); err != nil {
 		return nil, fmt.Errorf("ytdl: load astring: %w", err)
 	}
-
-	// Load the EJS core script → defines globalThis.jsc using the global
-	// meriyah and astring objects.
-	if _, err := js.Eval(string(ejsCoreJS), nil); err != nil {
+	if _, err := ctx.RunScript(string(ejsCoreJS), "yt.solver.core.min.js"); err != nil {
 		return nil, fmt.Errorf("ytdl: load EJS script: %w", err)
 	}
 
-	// Verify that the EJS script exported the expected jsc function.
-	jscVal, err := js.GetGlobal("jsc")
-	if err != nil || jscVal == nil {
-		return nil, fmt.Errorf("ytdl: EJS script did not export a 'jsc' function")
+	if _, err := ctx.RunScript("var jsonParse=JSON.parse", "jsonParse.js"); err != nil {
+		return nil, fmt.Errorf("ytdl: load jsonParse: %w", err)
+	}
+
+	jscVal, err := ctx.RunScript("typeof jsc === 'function'", "check_jsc.js")
+	if err != nil {
+		return nil, fmt.Errorf("ytdl: check jsc availability: %w", err)
+	}
+	if !jscVal.Boolean() {
+		return nil, fmt.Errorf("ytdl: EJS script did not export a callable 'jsc' function")
 	}
 
 	client := opts.HTTPClient
 	if client == nil {
-		client = &http.Client{}
+		jar, _ := cookiejar.New(nil)
+		client = &http.Client{Jar: jar}
 	}
 
 	return &Downloader{
-		js:         js,
+		iso:        iso,
+		ctx:        ctx,
 		httpClient: client,
 	}, nil
 }
@@ -252,6 +287,7 @@ func (d *Downloader) GetURL(videoID string, mediaType MediaType) (string, error)
 		if err == nil {
 			return streamURL, nil
 		}
+		log.Printf("Error decoding: %v \n", err)
 		lastErr = err
 	}
 	return "", lastErr
@@ -259,6 +295,15 @@ func (d *Downloader) GetURL(videoID string, mediaType MediaType) (string, error)
 
 // getURLWithClient is the per-client implementation called by GetURL.
 func (d *Downloader) getURLWithClient(videoID string, mediaType MediaType, client innertubeClientConfig) (string, error) {
+	// For clients that need the JS player (TV, WEB) pre-fetch the watch page
+	// now, before the InnerTube POST, so that YouTube session cookies are
+	// already in the jar when the API request is made.
+	if client.requiresJSPlayer {
+		if _, err := d.fetchPlayerURL(videoID); err != nil {
+			log.Printf("ytdl: pre-fetch watch page for cookie jar: %v", err)
+		}
+	}
+
 	pr, err := d.fetchPlayerResponse(videoID, client)
 	if err != nil {
 		return "", fmt.Errorf("ytdl: %w", err)
@@ -578,8 +623,13 @@ func (d *Downloader) solveNChallenge(videoID, streamURL string) (string, error) 
 
 // fetchPlayerURL retrieves the URL of the YouTube player JavaScript file for
 // a given video by fetching the watch page and searching for the embedded
-// player path.
+// player path.  Results are cached by video ID so the watch page is fetched
+// at most once per video per Downloader lifetime.
 func (d *Downloader) fetchPlayerURL(videoID string) (string, error) {
+	if cached, ok := d.playerURLByVideo.Load(videoID); ok {
+		return cached.(string), nil
+	}
+
 	watchURL := "https://www.youtube.com/watch?v=" + url.QueryEscape(videoID)
 	req, err := http.NewRequest(http.MethodGet, watchURL, nil)
 	if err != nil {
@@ -604,7 +654,9 @@ func (d *Downloader) fetchPlayerURL(videoID string) (string, error) {
 	if match == nil {
 		return "", fmt.Errorf("player JS URL not found in watch page for video %q", videoID)
 	}
-	return "https://www.youtube.com" + string(match), nil
+	playerURL := "https://www.youtube.com" + string(match)
+	d.playerURLByVideo.Store(videoID, playerURL)
+	return playerURL, nil
 }
 
 // fetchPlayerJS downloads the YouTube player JavaScript source.  Results are
@@ -680,8 +732,8 @@ type ejsResponse struct {
 // more challenges of the given type ("n" or "sig").  It returns a map of
 // challenge value → solved value.
 //
-// runEJS is safe to call concurrently; the QuickJS context serialises
-// concurrent access internally.
+// runEJS is safe to call concurrently; it serialises access to the v8go
+// context with a mutex.
 func (d *Downloader) runEJS(playerURL, playerJS, challengeType string, challenges []string) (map[string]string, error) {
 	// Build the input JSON.
 	var input ejsInput
@@ -703,21 +755,25 @@ func (d *Downloader) runEJS(playerURL, playerJS, challengeType string, challenge
 		return nil, fmt.Errorf("marshal EJS input: %w", err)
 	}
 
-	// Call jsc(input) inside QuickJS.  The context's internal mutex
-	// serialises concurrent calls.
-	result, err := d.js.Eval("jsc("+string(inputJSON)+")", nil)
+	// Serialise access to the v8go context.
+	d.jsMu.Lock()
+	defer d.jsMu.Unlock()
+
+	// Set the JSON payload as a global string so that special characters in
+	// the player JS source (backslashes, template literals, </script>, etc.)
+	// cannot break the surrounding JavaScript syntax.  jsonParse (aliased to
+	// JSON.parse at init time) then decodes it safely inside V8.
+	if err := d.ctx.Global().Set("_ejsInput", string(inputJSON)); err != nil {
+		return nil, fmt.Errorf("set _ejsInput global: %w", err)
+	}
+
+	val, err := d.ctx.RunScript("JSON.stringify(jsc(jsonParse(_ejsInput)))", "ejs_call.js")
 	if err != nil {
 		return nil, fmt.Errorf("jsc() call failed: %w", err)
 	}
 
-	// Serialise the result back to JSON for easy Go-side handling.
-	resultJSON, err := json.Marshal(result)
-	if err != nil {
-		return nil, fmt.Errorf("marshal EJS output: %w", err)
-	}
-
 	var output ejsOutput
-	if err := json.Unmarshal(resultJSON, &output); err != nil {
+	if err := json.Unmarshal([]byte(val.String()), &output); err != nil {
 		return nil, fmt.Errorf("decode EJS output: %w", err)
 	}
 
