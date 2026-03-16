@@ -78,31 +78,71 @@ type Downloader struct {
 	preprocessedCache sync.Map // map[string]json.RawMessage
 }
 
-// innertubeClient holds the InnerTube context for the android_vr client.
-// This client returns direct (non-ciphered) stream URLs and does not require
-// proof-of-origin tokens, making it the simplest client to use without a
-// browser.
-var innertubeClientCtx = map[string]interface{}{
-	"context": map[string]interface{}{
-		"client": map[string]interface{}{
-			"clientName":        "ANDROID_VR",
-			"clientVersion":     "1.65.10",
-			"deviceMake":        "Oculus",
-			"deviceModel":       "Quest 3",
-			"androidSdkVersion": 32,
-			"userAgent":         "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-			"osName":            "Android",
-			"osVersion":         "12L",
-		},
-	},
+const innertubePlayerEndpoint = "https://www.youtube.com/youtubei/v1/player"
+
+// innertubeClientConfig groups all parameters needed to make an InnerTube
+// /player request for a particular client identity.
+//
+// Both android_vr and ios have REQUIRE_JS_PLAYER=False in yt-dlp, meaning
+// they return direct stream URLs that do not need signature-cipher decoding.
+type innertubeClientConfig struct {
+	// context is the JSON object placed under the "context" key in the
+	// request body.  It is reproduced verbatim from yt-dlp's
+	// INNERTUBE_CLIENTS registry.
+	context map[string]interface{}
+	// clientNameID is the numeric identifier sent in X-Youtube-Client-Name.
+	clientNameID string
+	// clientVersion is sent in X-Youtube-Client-Version.
+	clientVersion string
+	// userAgent is sent in the User-Agent header.
+	userAgent string
 }
 
-const (
-	innertubePlayerEndpoint = "https://www.youtube.com/youtubei/v1/player"
-	innertubeClientNameID   = "28"
-	innertubeClientVersion  = "1.65.10"
-	innertubeUserAgent      = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-)
+// clientAndroidVR is the ANDROID_VR InnerTube client (client ID 28).
+//
+// This is the preferred client because it returns direct stream URLs without
+// requiring proof-of-origin tokens.  However, YouTube may return
+// "Sign in to confirm you're not a bot" for some videos when using this
+// client.  In that case the code falls back to clientIOS.
+var clientAndroidVR = innertubeClientConfig{
+	context: map[string]interface{}{
+		"clientName":        "ANDROID_VR",
+		"clientVersion":     "1.65.10",
+		"deviceMake":        "Oculus",
+		"deviceModel":       "Quest 3",
+		"androidSdkVersion": 32,
+		"userAgent":         "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+		"osName":            "Android",
+		"osVersion":         "12L",
+	},
+	clientNameID:  "28",
+	clientVersion: "1.65.10",
+	userAgent:     "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+}
+
+// clientIOS is the IOS InnerTube client (client ID 5).
+//
+// Like android_vr it has REQUIRE_JS_PLAYER=False (direct stream URLs), and
+// it is significantly less likely to be bot-checked by YouTube.  It is used
+// as a fallback when android_vr is rejected.
+var clientIOS = innertubeClientConfig{
+	context: map[string]interface{}{
+		"clientName":    "IOS",
+		"clientVersion": "21.02.3",
+		"deviceMake":    "Apple",
+		"deviceModel":   "iPhone16,2",
+		"userAgent":     "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+		"osName":        "iPhone",
+		"osVersion":     "18.3.2.22D82",
+	},
+	clientNameID:  "5",
+	clientVersion: "21.02.3",
+	userAgent:     "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+}
+
+// defaultClients is the ordered list of InnerTube clients tried by GetURL.
+// android_vr is attempted first; ios is the fallback.
+var defaultClients = []innertubeClientConfig{clientAndroidVR, clientIOS}
 
 // playerURLRe matches the player JavaScript URL embedded in the YouTube
 // watch-page HTML, e.g. /s/player/HASH/player_ias.vflset/en_US/base.js
@@ -184,6 +224,11 @@ func NewDownloaderWithOptions(ejsScriptPath string, opts Options) (*Downloader, 
 //
 // mediaType must be [MediaTypeVideo] or [MediaTypeAudio].
 //
+// GetURL tries multiple InnerTube clients in order (android_vr first, ios
+// as fallback).  If the preferred client is rejected by YouTube (e.g. with
+// "Sign in to confirm you're not a bot") the next client is tried
+// automatically.
+//
 // When the stream URL contains an n-throttle parameter, GetURL automatically
 // downloads the YouTube player JavaScript and uses the EJS script to solve
 // the challenge, returning a de-throttled URL.
@@ -195,7 +240,20 @@ func (d *Downloader) GetURL(videoID string, mediaType MediaType) (string, error)
 		return "", fmt.Errorf("ytdl: unknown MediaType %q; use MediaTypeVideo or MediaTypeAudio", mediaType)
 	}
 
-	pr, err := d.fetchPlayerResponse(videoID)
+	var lastErr error
+	for _, client := range defaultClients {
+		streamURL, err := d.getURLWithClient(videoID, mediaType, client)
+		if err == nil {
+			return streamURL, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
+}
+
+// getURLWithClient is the per-client implementation called by GetURL.
+func (d *Downloader) getURLWithClient(videoID string, mediaType MediaType, client innertubeClientConfig) (string, error) {
+	pr, err := d.fetchPlayerResponse(videoID, client)
 	if err != nil {
 		return "", fmt.Errorf("ytdl: %w", err)
 	}
@@ -266,12 +324,13 @@ func (f streamFormat) effectiveBitrate() int {
 	return f.Bitrate
 }
 
-func (d *Downloader) fetchPlayerResponse(videoID string) (*playerResponse, error) {
-	body := make(map[string]interface{})
-	for k, v := range innertubeClientCtx {
-		body[k] = v
+func (d *Downloader) fetchPlayerResponse(videoID string, client innertubeClientConfig) (*playerResponse, error) {
+	body := map[string]interface{}{
+		"context": map[string]interface{}{
+			"client": client.context,
+		},
+		"videoId": videoID,
 	}
-	body["videoId"] = videoID
 
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -283,9 +342,9 @@ func (d *Downloader) fetchPlayerResponse(videoID string) (*playerResponse, error
 		return nil, fmt.Errorf("create player request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", innertubeUserAgent)
-	req.Header.Set("X-Youtube-Client-Name", innertubeClientNameID)
-	req.Header.Set("X-Youtube-Client-Version", innertubeClientVersion)
+	req.Header.Set("User-Agent", client.userAgent)
+	req.Header.Set("X-Youtube-Client-Name", client.clientNameID)
+	req.Header.Set("X-Youtube-Client-Version", client.clientVersion)
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
