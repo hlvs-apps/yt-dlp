@@ -1,0 +1,586 @@
+// Package ytdl provides YouTube stream URL extraction using the yt-dlp EJS
+// challenge solver script and the goja JavaScript engine.
+//
+// Usage:
+//
+//	dl, err := ytdl.NewDownloader("/path/to/yt.solver.core.js")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	videoURL, err := dl.GetURL("dQw4w9WgXcQ", ytdl.MediaTypeVideo)
+//	audioURL, err := dl.GetURL("dQw4w9WgXcQ", ytdl.MediaTypeAudio)
+package ytdl
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/dop251/goja"
+
+	_ "embed"
+)
+
+// meriyahJS and astringJS are vendored UMD bundles embedded into the binary so
+// the EJS core script's dependency on the meriyah and astring JavaScript
+// libraries is satisfied without a Node.js runtime.
+//
+//go:embed js/meriyah.umd.min.js
+var meriyahJS []byte
+
+//go:embed js/astring.min.js
+var astringJS []byte
+
+// MediaType selects the kind of stream URL to return.
+type MediaType string
+
+const (
+	// MediaTypeVideo returns the highest-quality video-only adaptive stream.
+	MediaTypeVideo MediaType = "video"
+	// MediaTypeAudio returns the highest-quality audio-only adaptive stream.
+	MediaTypeAudio MediaType = "audio"
+)
+
+// Options carries optional configuration for [NewDownloaderWithOptions].
+type Options struct {
+	// HTTPClient is used for all outbound network requests.  If nil the
+	// default http.Client is used.
+	HTTPClient *http.Client
+}
+
+// Downloader extracts YouTube stream URLs.
+//
+// A single Downloader instance is safe to use from multiple goroutines; an
+// internal mutex serialises access to the embedded goja JavaScript runtime.
+type Downloader struct {
+	vm      *goja.Runtime
+	jscFunc goja.Callable
+	jsMu    sync.Mutex
+
+	httpClient *http.Client
+
+	// playerJSCache maps a player URL to the downloaded player JavaScript
+	// source, avoiding repeated HTTP fetches for the same player version.
+	playerJSCache sync.Map // map[string]string
+
+	// preprocessedCache maps a player URL to the JSON-serialisable
+	// preprocessed_player object returned by the EJS jsc() function after
+	// the first call.  This lets subsequent calls skip the expensive AST
+	// parse step inside the EJS script.
+	preprocessedCache sync.Map // map[string]json.RawMessage
+}
+
+// innertubeClient holds the InnerTube context for the android_vr client.
+// This client returns direct (non-ciphered) stream URLs and does not require
+// proof-of-origin tokens, making it the simplest client to use without a
+// browser.
+var innertubeClientCtx = map[string]interface{}{
+	"context": map[string]interface{}{
+		"client": map[string]interface{}{
+			"clientName":        "ANDROID_VR",
+			"clientVersion":     "1.65.10",
+			"deviceMake":        "Oculus",
+			"deviceModel":       "Quest 3",
+			"androidSdkVersion": 32,
+			"userAgent":         "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+			"osName":            "Android",
+			"osVersion":         "12L",
+		},
+	},
+}
+
+const (
+	innertubePlayerEndpoint = "https://www.youtube.com/youtubei/v1/player"
+	innertubeClientNameID   = "28"
+	innertubeClientVersion  = "1.65.10"
+	innertubeUserAgent      = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+)
+
+// playerURLRe matches the player JavaScript URL embedded in the YouTube
+// watch-page HTML, e.g. /s/player/HASH/player_ias.vflset/en_US/base.js
+var playerURLRe = regexp.MustCompile(`/s/player/[a-zA-Z0-9_-]+/[^\s"'\\]+\.js`)
+
+// -----------------------------------------------------------------------
+// Public API
+// -----------------------------------------------------------------------
+
+// NewDownloader creates a [Downloader] that uses the EJS core script located
+// at ejsScriptPath.
+//
+// The file should be a yt.solver.core.js file from
+// https://github.com/yt-dlp/ejs/releases.  The meriyah and astring
+// JavaScript dependencies are embedded in the binary and do not need to be
+// provided separately.
+func NewDownloader(ejsScriptPath string) (*Downloader, error) {
+	return NewDownloaderWithOptions(ejsScriptPath, Options{})
+}
+
+// NewDownloaderWithOptions is like [NewDownloader] but accepts additional
+// [Options].
+func NewDownloaderWithOptions(ejsScriptPath string, opts Options) (*Downloader, error) {
+	ejsCode, err := os.ReadFile(ejsScriptPath)
+	if err != nil {
+		return nil, fmt.Errorf("ytdl: read EJS script %q: %w", ejsScriptPath, err)
+	}
+
+	vm := goja.New()
+
+	// Expose globalThis so that UMD bundles that use it can find the global
+	// object even in older versions of goja.
+	if err := vm.Set("globalThis", vm.GlobalObject()); err != nil {
+		return nil, fmt.Errorf("ytdl: set globalThis: %w", err)
+	}
+
+	// Load the meriyah UMD bundle → sets globalThis.meriyah
+	if _, err := vm.RunString(string(meriyahJS)); err != nil {
+		return nil, fmt.Errorf("ytdl: load meriyah: %w", err)
+	}
+
+	// Load the astring bundle → sets globalThis.astring
+	if _, err := vm.RunString(string(astringJS)); err != nil {
+		return nil, fmt.Errorf("ytdl: load astring: %w", err)
+	}
+
+	// Load the EJS core script → defines globalThis.jsc using the global
+	// meriyah and astring objects.
+	if _, err := vm.RunString(string(ejsCode)); err != nil {
+		return nil, fmt.Errorf("ytdl: load EJS script: %w", err)
+	}
+
+	jscVal := vm.Get("jsc")
+	if jscVal == nil || goja.IsUndefined(jscVal) || goja.IsNull(jscVal) {
+		return nil, fmt.Errorf("ytdl: EJS script did not export a 'jsc' function")
+	}
+	jscFunc, ok := goja.AssertFunction(jscVal)
+	if !ok {
+		return nil, fmt.Errorf("ytdl: 'jsc' is not a callable function")
+	}
+
+	client := opts.HTTPClient
+	if client == nil {
+		client = &http.Client{}
+	}
+
+	return &Downloader{
+		vm:         vm,
+		jscFunc:    jscFunc,
+		httpClient: client,
+	}, nil
+}
+
+// GetURL returns the URL of the highest-quality stream for the given YouTube
+// video ID and media type.
+//
+// videoID must be the 11-character YouTube video identifier
+// (e.g. "dQw4w9WgXcQ"), not a full URL.
+//
+// mediaType must be [MediaTypeVideo] or [MediaTypeAudio].
+//
+// When the stream URL contains an n-throttle parameter, GetURL automatically
+// downloads the YouTube player JavaScript and uses the EJS script to solve
+// the challenge, returning a de-throttled URL.
+func (d *Downloader) GetURL(videoID string, mediaType MediaType) (string, error) {
+	if videoID == "" {
+		return "", fmt.Errorf("ytdl: videoID must not be empty")
+	}
+	if mediaType != MediaTypeVideo && mediaType != MediaTypeAudio {
+		return "", fmt.Errorf("ytdl: unknown MediaType %q; use MediaTypeVideo or MediaTypeAudio", mediaType)
+	}
+
+	pr, err := d.fetchPlayerResponse(videoID)
+	if err != nil {
+		return "", fmt.Errorf("ytdl: %w", err)
+	}
+
+	if status := pr.PlayabilityStatus.Status; status != "OK" {
+		reason := pr.PlayabilityStatus.Reason
+		if reason == "" {
+			reason = status
+		}
+		return "", fmt.Errorf("ytdl: video %q is not playable: %s", videoID, reason)
+	}
+
+	fmts := collectFormats(pr, mediaType)
+	if len(fmts) == 0 {
+		return "", fmt.Errorf("ytdl: no %s formats available for video %q", mediaType, videoID)
+	}
+
+	sortFormats(fmts, mediaType)
+	best := fmts[0]
+
+	streamURL, err := d.solveNChallenge(videoID, best.URL)
+	if err != nil {
+		// Return the un-throttled URL rather than failing completely so that
+		// callers can still use it (albeit at potentially reduced speed).
+		return best.URL, nil
+	}
+	return streamURL, nil
+}
+
+// -----------------------------------------------------------------------
+// InnerTube player response
+// -----------------------------------------------------------------------
+
+// playerResponse is a minimal representation of the InnerTube /player
+// response.
+type playerResponse struct {
+	PlayabilityStatus struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	} `json:"playabilityStatus"`
+	StreamingData struct {
+		Formats         []streamFormat `json:"formats"`
+		AdaptiveFormats []streamFormat `json:"adaptiveFormats"`
+	} `json:"streamingData"`
+}
+
+// streamFormat represents a single audio or video stream descriptor inside a
+// player response.
+type streamFormat struct {
+	Itag            int    `json:"itag"`
+	URL             string `json:"url"`
+	MimeType        string `json:"mimeType"`
+	Bitrate         int    `json:"bitrate"`
+	AverageBitrate  int    `json:"averageBitrate"`
+	Width           int    `json:"width"`
+	Height          int    `json:"height"`
+	QualityLabel    string `json:"qualityLabel"`
+	Quality         string `json:"quality"`
+	AudioQuality    string `json:"audioQuality"`
+	SignatureCipher string `json:"signatureCipher"`
+}
+
+// effectiveBitrate returns the best available bitrate value.
+func (f streamFormat) effectiveBitrate() int {
+	if f.AverageBitrate > 0 {
+		return f.AverageBitrate
+	}
+	return f.Bitrate
+}
+
+func (d *Downloader) fetchPlayerResponse(videoID string) (*playerResponse, error) {
+	body := make(map[string]interface{})
+	for k, v := range innertubeClientCtx {
+		body[k] = v
+	}
+	body["videoId"] = videoID
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal player request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, innertubePlayerEndpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("create player request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", innertubeUserAgent)
+	req.Header.Set("X-Youtube-Client-Name", innertubeClientNameID)
+	req.Header.Set("X-Youtube-Client-Version", innertubeClientVersion)
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("player API request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("player API returned HTTP %d", resp.StatusCode)
+	}
+
+	var pr playerResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, fmt.Errorf("decode player response: %w", err)
+	}
+	return &pr, nil
+}
+
+// -----------------------------------------------------------------------
+// Format selection
+// -----------------------------------------------------------------------
+
+// internalFormat is a normalised representation used for sorting.
+type internalFormat struct {
+	URL          string
+	MimeType     string
+	Bitrate      int
+	Height       int
+	AudioQuality string
+}
+
+// collectFormats extracts the relevant stream formats from a player response.
+//
+// For MediaTypeVideo it returns adaptive video-only streams.
+// For MediaTypeAudio it returns adaptive audio-only streams.
+// Formats that require a signature cipher (not provided by the android_vr
+// client) or that have no direct URL are silently skipped.
+func collectFormats(pr *playerResponse, mediaType MediaType) []internalFormat {
+	var out []internalFormat
+	for _, f := range pr.StreamingData.AdaptiveFormats {
+		if f.URL == "" {
+			continue // requires cipher; skip
+		}
+		mime := strings.ToLower(f.MimeType)
+		switch mediaType {
+		case MediaTypeVideo:
+			if !strings.HasPrefix(mime, "video/") {
+				continue
+			}
+		case MediaTypeAudio:
+			if !strings.HasPrefix(mime, "audio/") {
+				continue
+			}
+		}
+		out = append(out, internalFormat{
+			URL:          f.URL,
+			MimeType:     f.MimeType,
+			Bitrate:      f.effectiveBitrate(),
+			Height:       f.Height,
+			AudioQuality: f.AudioQuality,
+		})
+	}
+	return out
+}
+
+// sortFormats orders formats from best to worst quality in-place.
+//
+// For video the primary sort key is height (resolution), with bitrate as a
+// tiebreaker.  For audio the only key is bitrate.
+func sortFormats(fmts []internalFormat, mediaType MediaType) {
+	sort.SliceStable(fmts, func(i, j int) bool {
+		a, b := fmts[i], fmts[j]
+		if mediaType == MediaTypeVideo {
+			if a.Height != b.Height {
+				return a.Height > b.Height
+			}
+		}
+		return a.Bitrate > b.Bitrate
+	})
+}
+
+// -----------------------------------------------------------------------
+// n-challenge solving
+// -----------------------------------------------------------------------
+
+// solveNChallenge checks whether streamURL contains a YouTube n-throttle
+// parameter and, if so, uses the EJS script to transform it into an
+// unthrottled value.  If no n parameter is present the original URL is
+// returned unchanged.
+func (d *Downloader) solveNChallenge(videoID, streamURL string) (string, error) {
+	parsed, err := url.Parse(streamURL)
+	if err != nil {
+		return streamURL, nil
+	}
+	query := parsed.Query()
+	nParam := query.Get("n")
+	if nParam == "" {
+		return streamURL, nil
+	}
+
+	playerURL, err := d.fetchPlayerURL(videoID)
+	if err != nil {
+		return "", fmt.Errorf("fetch player URL: %w", err)
+	}
+
+	playerJS, err := d.fetchPlayerJS(playerURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch player JS: %w", err)
+	}
+
+	results, err := d.runEJS(playerURL, playerJS, nParam)
+	if err != nil {
+		return "", fmt.Errorf("EJS n-challenge: %w", err)
+	}
+
+	solved, ok := results[nParam]
+	if !ok || solved == "" {
+		return "", fmt.Errorf("EJS returned no result for n-challenge %q", nParam)
+	}
+
+	query.Set("n", solved)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+// fetchPlayerURL retrieves the URL of the YouTube player JavaScript file for
+// a given video by fetching the watch page and searching for the embedded
+// player path.
+func (d *Downloader) fetchPlayerURL(videoID string) (string, error) {
+	watchURL := "https://www.youtube.com/watch?v=" + url.QueryEscape(videoID)
+	req, err := http.NewRequest(http.MethodGet, watchURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create watch request: %w", err)
+	}
+	// Use a desktop browser UA so that YouTube returns the full page.
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch watch page: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read watch page: %w", err)
+	}
+
+	match := playerURLRe.Find(data)
+	if match == nil {
+		return "", fmt.Errorf("player JS URL not found in watch page for video %q", videoID)
+	}
+	return "https://www.youtube.com" + string(match), nil
+}
+
+// fetchPlayerJS downloads the YouTube player JavaScript source.  Results are
+// cached keyed by player URL so that the file is fetched at most once per
+// player version per Downloader lifetime.
+func (d *Downloader) fetchPlayerJS(playerURL string) (string, error) {
+	if cached, ok := d.playerJSCache.Load(playerURL); ok {
+		return cached.(string), nil
+	}
+
+	resp, err := d.httpClient.Get(playerURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch player JS: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("player JS returned HTTP %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read player JS: %w", err)
+	}
+
+	js := string(data)
+	d.playerJSCache.Store(playerURL, js)
+	return js, nil
+}
+
+// ejsInput is the JSON payload passed to the jsc() function defined by the
+// EJS core script.
+type ejsInput struct {
+	// Type is either "player" (pass the raw player JS) or "preprocessed"
+	// (pass a previously computed preprocessed_player value).
+	Type string `json:"type"`
+
+	// Player is the raw YouTube player JavaScript source.  Used when
+	// Type == "player".
+	Player string `json:"player,omitempty"`
+
+	// PreprocessedPlayer is the cached AST analysis from a previous call.
+	// Used when Type == "preprocessed".
+	PreprocessedPlayer json.RawMessage `json:"preprocessed_player,omitempty"`
+
+	// Requests is the list of challenge requests to solve.
+	Requests []ejsRequest `json:"requests"`
+
+	// OutputPreprocessed requests that the response include the
+	// preprocessed player data so it can be cached.
+	OutputPreprocessed bool `json:"output_preprocessed"`
+}
+
+type ejsRequest struct {
+	Type       string   `json:"type"`
+	Challenges []string `json:"challenges"`
+}
+
+type ejsOutput struct {
+	Type               string            `json:"type"`
+	Error              string            `json:"error,omitempty"`
+	Responses          []ejsResponse     `json:"responses,omitempty"`
+	PreprocessedPlayer json.RawMessage   `json:"preprocessed_player,omitempty"`
+}
+
+type ejsResponse struct {
+	Type  string            `json:"type"`
+	Error string            `json:"error,omitempty"`
+	Data  map[string]string `json:"data,omitempty"`
+}
+
+// runEJS calls the jsc() function from the EJS core script to solve the
+// n-throttle challenge for the given challenge string.  It returns a map of
+// challenge → solved value.
+//
+// runEJS is safe to call concurrently; it serialises access to the goja VM
+// with a mutex.
+func (d *Downloader) runEJS(playerURL, playerJS, nChallenge string) (map[string]string, error) {
+	// Build the input JSON.
+	var input ejsInput
+	input.Requests = []ejsRequest{
+		{Type: "n", Challenges: []string{nChallenge}},
+	}
+
+	if cached, ok := d.preprocessedCache.Load(playerURL); ok {
+		input.Type = "preprocessed"
+		input.PreprocessedPlayer = cached.(json.RawMessage)
+	} else {
+		input.Type = "player"
+		input.Player = playerJS
+		input.OutputPreprocessed = true
+	}
+
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return nil, fmt.Errorf("marshal EJS input: %w", err)
+	}
+
+	// Serialise access to the goja runtime.
+	d.jsMu.Lock()
+	defer d.jsMu.Unlock()
+
+	// Parse the input JSON into a goja value and call jsc().
+	inputVal, err := d.vm.RunString("(" + string(inputJSON) + ")")
+	if err != nil {
+		return nil, fmt.Errorf("parse EJS input in VM: %w", err)
+	}
+
+	result, err := d.jscFunc(goja.Undefined(), inputVal)
+	if err != nil {
+		return nil, fmt.Errorf("jsc() call failed: %w", err)
+	}
+
+	// Serialise the result back to JSON for easy Go-side handling.
+	resultJSON, err := json.Marshal(result.Export())
+	if err != nil {
+		return nil, fmt.Errorf("marshal EJS output: %w", err)
+	}
+
+	var output ejsOutput
+	if err := json.Unmarshal(resultJSON, &output); err != nil {
+		return nil, fmt.Errorf("decode EJS output: %w", err)
+	}
+
+	if output.Type == "error" {
+		return nil, fmt.Errorf("EJS error: %s", output.Error)
+	}
+
+	// Cache the preprocessed player for future calls with the same player.
+	if len(output.PreprocessedPlayer) > 0 {
+		d.preprocessedCache.Store(playerURL, output.PreprocessedPlayer)
+	}
+
+	if len(output.Responses) == 0 {
+		return nil, fmt.Errorf("EJS returned no responses")
+	}
+
+	resp := output.Responses[0]
+	if resp.Type == "error" {
+		return nil, fmt.Errorf("EJS n-challenge error: %s", resp.Error)
+	}
+
+	return resp.Data, nil
+}

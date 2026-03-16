@@ -1,0 +1,395 @@
+package ytdl
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// minimalEJSScript is a minimal stub that implements the jsc() interface used
+// by the real EJS core script.  It is used in unit tests to avoid requiring
+// the real yt.solver.core.js file.
+//
+// For n-challenges it simply reverses the input string as a predictable
+// transformation; for sig-challenges it returns the input unchanged.
+const minimalEJSScript = `
+var jsc = (function(meriyah, astring) {
+    function main(input) {
+        var player = input.type === 'player' ? input.player : input.preprocessed_player;
+        var responses = input.requests.map(function(req) {
+            if (req.type !== 'n' && req.type !== 'sig') {
+                return { type: 'error', error: 'unknown type: ' + req.type };
+            }
+            var data = {};
+            req.challenges.forEach(function(c) {
+                // Stub: reverse the string as a fake transformation.
+                data[c] = c.split('').reverse().join('');
+            });
+            return { type: 'result', data: data };
+        });
+        var out = { type: 'result', responses: responses };
+        if (input.type === 'player' && input.output_preprocessed) {
+            out.preprocessed_player = { stub: true };
+        }
+        return out;
+    }
+    return main;
+})(meriyah, astring);
+`
+
+// buildTestDownloader creates a [Downloader] using the minimal stub EJS
+// script written to a temporary file.  The provided HTTP handler is used to
+// serve all requests made by the Downloader.
+func buildTestDownloader(t *testing.T, handler http.Handler) *Downloader {
+	t.Helper()
+
+	// Write the stub EJS script to a temp file.
+	dir := t.TempDir()
+	ejsPath := filepath.Join(dir, "yt.solver.core.js")
+	if err := os.WriteFile(ejsPath, []byte(minimalEJSScript), 0o600); err != nil {
+		t.Fatalf("write stub EJS: %v", err)
+	}
+
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	opts := Options{
+		HTTPClient: srv.Client(),
+	}
+
+	// Redirect all outbound requests to the test server by replacing the
+	// Transport with one that rewrites the host.
+	transport := &rewriteTransport{base: srv.Client().Transport, target: srv.URL}
+	opts.HTTPClient.Transport = transport
+
+	dl, err := NewDownloaderWithOptions(ejsPath, opts)
+	if err != nil {
+		t.Fatalf("NewDownloaderWithOptions: %v", err)
+	}
+	return dl
+}
+
+// rewriteTransport rewrites all request URLs to the target server so that
+// integration tests can intercept external HTTP calls.
+type rewriteTransport struct {
+	base   http.RoundTripper
+	target string
+}
+
+func (rt *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	parsed, _ := url.Parse(rt.target)
+	clone := req.Clone(req.Context())
+	clone.URL.Scheme = parsed.Scheme
+	clone.URL.Host = parsed.Host
+	// Reset the Host header so the test server receives the request.
+	clone.Host = parsed.Host
+	base := rt.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(clone)
+}
+
+// -----------------------------------------------------------------------
+// Unit tests for internal helpers
+// -----------------------------------------------------------------------
+
+func TestCollectFormats_VideoOnly(t *testing.T) {
+	pr := &playerResponse{}
+	pr.StreamingData.AdaptiveFormats = []streamFormat{
+		{URL: "https://example.com/v1", MimeType: "video/mp4", Bitrate: 1_000_000, Height: 720},
+		{URL: "https://example.com/a1", MimeType: "audio/mp4", Bitrate: 128_000},
+		{URL: "https://example.com/v2", MimeType: "video/webm", Bitrate: 2_000_000, Height: 1080},
+		// No URL – should be skipped.
+		{URL: "", MimeType: "video/mp4", Bitrate: 500_000, Height: 480},
+	}
+
+	fmts := collectFormats(pr, MediaTypeVideo)
+	if len(fmts) != 2 {
+		t.Fatalf("expected 2 video formats, got %d", len(fmts))
+	}
+	for _, f := range fmts {
+		if !strings.HasPrefix(strings.ToLower(f.MimeType), "video/") {
+			t.Errorf("non-video MIME type in result: %q", f.MimeType)
+		}
+	}
+}
+
+func TestCollectFormats_AudioOnly(t *testing.T) {
+	pr := &playerResponse{}
+	pr.StreamingData.AdaptiveFormats = []streamFormat{
+		{URL: "https://example.com/v1", MimeType: "video/mp4", Bitrate: 1_000_000, Height: 720},
+		{URL: "https://example.com/a1", MimeType: "audio/mp4", Bitrate: 128_000},
+		{URL: "https://example.com/a2", MimeType: "audio/webm", Bitrate: 256_000},
+	}
+
+	fmts := collectFormats(pr, MediaTypeAudio)
+	if len(fmts) != 2 {
+		t.Fatalf("expected 2 audio formats, got %d", len(fmts))
+	}
+	for _, f := range fmts {
+		if !strings.HasPrefix(strings.ToLower(f.MimeType), "audio/") {
+			t.Errorf("non-audio MIME type in result: %q", f.MimeType)
+		}
+	}
+}
+
+func TestSortFormats_Video(t *testing.T) {
+	fmts := []internalFormat{
+		{URL: "low", Height: 360, Bitrate: 300_000},
+		{URL: "high", Height: 1080, Bitrate: 2_000_000},
+		{URL: "mid", Height: 720, Bitrate: 1_000_000},
+	}
+	sortFormats(fmts, MediaTypeVideo)
+	if fmts[0].URL != "high" {
+		t.Errorf("expected 'high' first, got %q", fmts[0].URL)
+	}
+	if fmts[1].URL != "mid" {
+		t.Errorf("expected 'mid' second, got %q", fmts[1].URL)
+	}
+}
+
+func TestSortFormats_Audio(t *testing.T) {
+	fmts := []internalFormat{
+		{URL: "low", Bitrate: 64_000},
+		{URL: "high", Bitrate: 320_000},
+		{URL: "mid", Bitrate: 128_000},
+	}
+	sortFormats(fmts, MediaTypeAudio)
+	if fmts[0].URL != "high" {
+		t.Errorf("expected 'high' first, got %q", fmts[0].URL)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Unit test for the goja-based EJS wrapper
+// -----------------------------------------------------------------------
+
+func TestNewDownloader_LoadsEJSScript(t *testing.T) {
+	dir := t.TempDir()
+	ejsPath := filepath.Join(dir, "yt.solver.core.js")
+	if err := os.WriteFile(ejsPath, []byte(minimalEJSScript), 0o600); err != nil {
+		t.Fatalf("write stub EJS: %v", err)
+	}
+
+	dl, err := NewDownloader(ejsPath)
+	if err != nil {
+		t.Fatalf("NewDownloader: %v", err)
+	}
+	if dl == nil {
+		t.Fatal("NewDownloader returned nil Downloader")
+	}
+}
+
+func TestNewDownloader_MissingScript(t *testing.T) {
+	_, err := NewDownloader("/tmp/does_not_exist_ytdl_test.js")
+	if err == nil {
+		t.Fatal("expected error for missing EJS script, got nil")
+	}
+}
+
+func TestNewDownloader_InvalidScript(t *testing.T) {
+	dir := t.TempDir()
+	ejsPath := filepath.Join(dir, "bad.js")
+	if err := os.WriteFile(ejsPath, []byte("this is not valid JS {{{"), 0o600); err != nil {
+		t.Fatalf("write bad JS: %v", err)
+	}
+	_, err := NewDownloader(ejsPath)
+	if err == nil {
+		t.Fatal("expected error for invalid JS, got nil")
+	}
+}
+
+func TestRunEJS_NChallengeStub(t *testing.T) {
+	dir := t.TempDir()
+	ejsPath := filepath.Join(dir, "yt.solver.core.js")
+	if err := os.WriteFile(ejsPath, []byte(minimalEJSScript), 0o600); err != nil {
+		t.Fatalf("write stub EJS: %v", err)
+	}
+
+	dl, err := NewDownloader(ejsPath)
+	if err != nil {
+		t.Fatalf("NewDownloader: %v", err)
+	}
+
+	const challenge = "ABCxyz"
+	results, err := dl.runEJS("https://example.com/player.js", "// fake player JS", challenge)
+	if err != nil {
+		t.Fatalf("runEJS: %v", err)
+	}
+
+	got, ok := results[challenge]
+	if !ok {
+		t.Fatalf("no result for challenge %q; got %v", challenge, results)
+	}
+
+	// The stub reverses the input.
+	want := "zyxCBA"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Integration-style tests using a mock HTTP server
+// -----------------------------------------------------------------------
+
+// mockHandler returns an http.Handler that serves a minimal YouTube API
+// environment, including the player response and player JavaScript.
+func mockHandler(t *testing.T, videoID string, hasNParam bool) http.Handler {
+	t.Helper()
+
+	nValue := "AAABBBCCC"
+	streamURL := "https://rr1.example.com/videoplayback?expire=99999&itag=137"
+	if hasNParam {
+		streamURL += "&n=" + nValue
+	}
+
+	playerResponse := map[string]interface{}{
+		"playabilityStatus": map[string]interface{}{
+			"status": "OK",
+		},
+		"streamingData": map[string]interface{}{
+			"adaptiveFormats": []map[string]interface{}{
+				{
+					"itag":           137,
+					"url":            streamURL,
+					"mimeType":       "video/mp4; codecs=\"avc1.640028\"",
+					"bitrate":        3_000_000,
+					"averageBitrate": 2_800_000,
+					"width":          1920,
+					"height":         1080,
+					"quality":        "hd1080",
+					"qualityLabel":   "1080p",
+				},
+				{
+					"itag":           140,
+					"url":            "https://rr1.example.com/videoplayback?expire=99999&itag=140",
+					"mimeType":       "audio/mp4; codecs=\"mp4a.40.2\"",
+					"bitrate":        128_000,
+					"averageBitrate": 128_000,
+					"audioQuality":   "AUDIO_QUALITY_MEDIUM",
+				},
+			},
+		},
+	}
+
+	playerResponseJSON, _ := json.Marshal(playerResponse)
+
+	mux := http.NewServeMux()
+
+	// InnerTube player endpoint.
+	mux.HandleFunc("/youtubei/v1/player", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(playerResponseJSON)
+	})
+
+	// YouTube watch page – contains a player JS URL.
+	mux.HandleFunc("/watch", func(w http.ResponseWriter, r *http.Request) {
+		page := `<html><body>
+			<script>var ytcfg = {"PLAYER_JS_URL":"/s/player/abc12345/player_ias.vflset/en_US/base.js"};</script>
+			</body></html>`
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(page))
+	})
+
+	// Player JavaScript.
+	mux.HandleFunc("/s/player/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte("// fake player JS"))
+	})
+
+	return mux
+}
+
+func TestGetURL_VideoNoNParam(t *testing.T) {
+	dl := buildTestDownloader(t, mockHandler(t, "testVideoID", false))
+
+	got, err := dl.GetURL("testVideoID", MediaTypeVideo)
+	if err != nil {
+		t.Fatalf("GetURL: %v", err)
+	}
+	if !strings.Contains(got, "itag=137") {
+		t.Errorf("expected video itag=137 in URL, got %q", got)
+	}
+}
+
+func TestGetURL_AudioNoNParam(t *testing.T) {
+	dl := buildTestDownloader(t, mockHandler(t, "testVideoID", false))
+
+	got, err := dl.GetURL("testVideoID", MediaTypeAudio)
+	if err != nil {
+		t.Fatalf("GetURL: %v", err)
+	}
+	if !strings.Contains(got, "itag=140") {
+		t.Errorf("expected audio itag=140 in URL, got %q", got)
+	}
+}
+
+func TestGetURL_VideoWithNParam(t *testing.T) {
+	dl := buildTestDownloader(t, mockHandler(t, "testVideoID", true))
+
+	got, err := dl.GetURL("testVideoID", MediaTypeVideo)
+	if err != nil {
+		t.Fatalf("GetURL: %v", err)
+	}
+
+	// The stub EJS reverses the n parameter: "AAABBBCCC" → "CCCBBBAAA".
+	// Ensure the original value is gone.
+	if strings.Contains(got, "n=AAABBBCCC") {
+		t.Errorf("n parameter was not transformed; got URL %q", got)
+	}
+	// Ensure an n parameter is still present (with the transformed value).
+	if !strings.Contains(got, "n=") {
+		t.Errorf("n parameter disappeared from URL %q", got)
+	}
+}
+
+func TestGetURL_EmptyVideoID(t *testing.T) {
+	dir := t.TempDir()
+	ejsPath := filepath.Join(dir, "yt.solver.core.js")
+	_ = os.WriteFile(ejsPath, []byte(minimalEJSScript), 0o600)
+	dl, _ := NewDownloader(ejsPath)
+
+	_, err := dl.GetURL("", MediaTypeVideo)
+	if err == nil {
+		t.Fatal("expected error for empty videoID, got nil")
+	}
+}
+
+func TestGetURL_InvalidMediaType(t *testing.T) {
+	dir := t.TempDir()
+	ejsPath := filepath.Join(dir, "yt.solver.core.js")
+	_ = os.WriteFile(ejsPath, []byte(minimalEJSScript), 0o600)
+	dl, _ := NewDownloader(ejsPath)
+
+	_, err := dl.GetURL("dQw4w9WgXcQ", "unknown")
+	if err == nil {
+		t.Fatal("expected error for invalid media type, got nil")
+	}
+}
+
+func TestGetURL_UnavailableVideo(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/youtubei/v1/player", func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]interface{}{
+			"playabilityStatus": map[string]interface{}{
+				"status": "ERROR",
+				"reason": "Video unavailable",
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	dl := buildTestDownloader(t, mux)
+	_, err := dl.GetURL("badVideoID", MediaTypeVideo)
+	if err == nil {
+		t.Fatal("expected error for unavailable video, got nil")
+	}
+}
