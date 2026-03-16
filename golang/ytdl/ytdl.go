@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	dl, err := ytdl.NewDownloader("/path/to/yt.solver.core.js")
+//	dl, err := ytdl.NewDownloader()
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -18,7 +18,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -38,6 +37,13 @@ var meriyahJS []byte
 
 //go:embed js/astring.min.js
 var astringJS []byte
+
+// ejsCoreJS is the vendored yt.solver.core.js from the yt-dlp project.
+// It is the same file used by the Python yt-dlp implementation and is
+// located at yt_dlp/extractor/youtube/jsc/_builtin/vendor/yt.solver.core.js.
+//
+//go:embed js/yt.solver.core.js
+var ejsCoreJS []byte
 
 // MediaType selects the kind of stream URL to return.
 type MediaType string
@@ -167,25 +173,18 @@ var playerURLRe = regexp.MustCompile(`/s/player/[a-zA-Z0-9_-]+/[^\s"'\\]+\.js`)
 // Public API
 // -----------------------------------------------------------------------
 
-// NewDownloader creates a [Downloader] that uses the EJS core script located
-// at ejsScriptPath.
+// NewDownloader creates a [Downloader] using the vendored yt.solver.core.js
+// that is bundled with this library.  The same script is used by the Python
+// yt-dlp implementation.
 //
-// The file should be a yt.solver.core.js file from
-// https://github.com/yt-dlp/ejs/releases.  The meriyah and astring
-// JavaScript dependencies are embedded in the binary and do not need to be
-// provided separately.
-func NewDownloader(ejsScriptPath string) (*Downloader, error) {
-	return NewDownloaderWithOptions(ejsScriptPath, Options{})
+// Initialize once and reuse the returned Downloader for all subsequent calls.
+func NewDownloader() (*Downloader, error) {
+	return NewDownloaderWithOptions(Options{})
 }
 
 // NewDownloaderWithOptions is like [NewDownloader] but accepts additional
 // [Options].
-func NewDownloaderWithOptions(ejsScriptPath string, opts Options) (*Downloader, error) {
-	ejsCode, err := os.ReadFile(ejsScriptPath)
-	if err != nil {
-		return nil, fmt.Errorf("ytdl: read EJS script %q: %w", ejsScriptPath, err)
-	}
-
+func NewDownloaderWithOptions(opts Options) (*Downloader, error) {
 	vm := goja.New()
 
 	// Expose globalThis so that UMD bundles that use it can find the global
@@ -206,7 +205,7 @@ func NewDownloaderWithOptions(ejsScriptPath string, opts Options) (*Downloader, 
 
 	// Load the EJS core script → defines globalThis.jsc using the global
 	// meriyah and astring objects.
-	if _, err := vm.RunString(string(ejsCode)); err != nil {
+	if _, err := vm.RunString(string(ejsCoreJS)); err != nil {
 		return nil, fmt.Errorf("ytdl: load EJS script: %w", err)
 	}
 
@@ -239,14 +238,15 @@ func NewDownloaderWithOptions(ejsScriptPath string, opts Options) (*Downloader, 
 //
 // mediaType must be [MediaTypeVideo] or [MediaTypeAudio].
 //
-// GetURL tries multiple InnerTube clients in order (android_vr first, ios
-// as fallback).  If the preferred client is rejected by YouTube (e.g. with
-// "Sign in to confirm you're not a bot") the next client is tried
+// GetURL tries multiple InnerTube clients in order (tv first, android_vr and
+// ios as fallbacks).  If the preferred client is rejected by YouTube (e.g.
+// with "Sign in to confirm you're not a bot") the next client is tried
 // automatically.
 //
-// When the stream URL contains an n-throttle parameter, GetURL automatically
-// downloads the YouTube player JavaScript and uses the EJS script to solve
-// the challenge, returning a de-throttled URL.
+// When the stream URL contains a signatureCipher (tv client) or an n-throttle
+// parameter, GetURL automatically downloads the YouTube player JavaScript and
+// uses the bundled yt.solver.core.js to solve the challenge, returning a
+// fully playable URL.
 func (d *Downloader) GetURL(videoID string, mediaType MediaType) (string, error) {
 	if videoID == "" {
 		return "", fmt.Errorf("ytdl: videoID must not be empty")
