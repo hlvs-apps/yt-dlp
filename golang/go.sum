@@ -2,3 +2,5 @@ github.com/rosbit/go-embedding-utils v0.4.2 h1:wbMK9A1f4+8aVA2YxNT+7mpt+RmJOqt6B
 github.com/rosbit/go-embedding-utils v0.4.2/go.mod h1:vN49YyUkB9OQI4t/6ofn0+kHYOrn/mAP1cqkzITBoEw=
 github.com/rosbit/go-quickjs v0.7.0 h1:J9HMjd/ugTeNFKCbeB7J65XAwQ3Jq4WUJGj9KP71tJQ=
 github.com/rosbit/go-quickjs v0.7.0/go.mod h1:Lv244FnYhnoEpG7kvSZ7vBF+rC+hCNPnim4+ZkrR/4c=
+rogchap.com/v8go v0.9.0 h1:wYbUCO4h6fjTamziHrzyrPnpFNuzPpjZY+nfmZjNaew=
+rogchap.com/v8go v0.9.0/go.mod h1:MxgP3pL2MW4dpme/72QRs8sgNMmM0pRc8DPhcuLWPAs=
